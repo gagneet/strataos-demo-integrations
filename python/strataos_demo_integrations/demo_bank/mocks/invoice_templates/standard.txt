@@ -1,0 +1,42 @@
+TAX INVOICE
+Precision Building Services Pty Ltd
+ABN: 47 123 456 789
+123 Industrial Avenue
+Mitchell ACT 2911
+Phone: (02) 6123 4567
+
+Invoice Number: INV-2026-0042
+Invoice Date: 15/04/2026
+Due Date: 15/05/2026
+
+Bill To:
+The Owners Corporation
+East Gate Residences
+Denman Prospect ACT 2914
+
+Description of Services:
+------------------------------------------------------------
+Item 1: Quarterly fire safety inspection and testing
+        Common areas, corridors, stairwells, basement
+        Amount: $1,500.00
+
+Item 2: Annual exit and emergency lighting test
+        Full building audit per AS 2293.2
+        Amount: $850.00
+
+Item 3: Replace 4x emergency light batteries (supplied)
+        Amount: $320.00
+------------------------------------------------------------
+Subtotal:                          $2,670.00
+GST (10%):                           $267.00
+Total Amount Due:                  $2,937.00
+------------------------------------------------------------
+
+Bank Transfer Details:
+BSB: 062-000
+Account: 12345678
+Account Name: Precision Building Services Pty Ltd
+Reference: INV-2026-0042
+
+Payment terms: 30 days net.
+Thank you for your business.

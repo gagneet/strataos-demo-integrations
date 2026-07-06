@@ -1,0 +1,23 @@
+# CBA (Commonwealth Bank of Australia) CSV export schema
+# Format: signed Amount column (negative = debit, positive = credit)
+# Date format: DD/MM/YYYY
+# Header rows to skip: 1
+
+bank: cba
+bank_name: Commonwealth Bank of Australia
+date_format: "%d/%m/%Y"
+skip_rows: 1
+amount_mode: signed  # single signed Amount column; no separate Debit/Credit
+
+columns:
+  date: Date
+  amount: Amount        # signed float; negative = money out, positive = money in
+  description: Description
+  balance: Balance       # running balance after transaction
+
+notes: |
+  CBA NetBank CSV export has a single header row.
+  The Amount column is already signed — no transformation needed beyond
+  converting to integer cents: round(float(Amount) * 100).
+  Balance is informational only; the platform recomputes running balance
+  from the opening_balance_cents stored in trust_bank_accounts.

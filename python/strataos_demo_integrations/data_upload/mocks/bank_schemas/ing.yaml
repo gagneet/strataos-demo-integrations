@@ -1,0 +1,33 @@
+# ING Business Banking CSV export schema
+# Format: separate Credit and Debit columns (both positive numbers)
+# Date format: YYYY-MM-DD (ISO 8601)
+# Header rows to skip: 1
+
+bank: ing
+bank_name: ING Bank (Australia) — Business
+date_format: "%Y-%m-%d"
+skip_rows: 1
+amount_mode: split  # separate Credit and Debit columns (note: Credit listed before Debit)
+
+columns:
+  date: Date
+  description: Description
+  credit: Credit   # positive number when money enters the account; empty otherwise
+  debit: Debit    # positive number when money leaves the account; empty otherwise
+  balance: Balance  # running balance after transaction
+
+amount_derivation: |
+  # ING column order is Credit before Debit — check Credit first
+  if Credit is not empty and float(Credit) != 0:
+      amount_cents = +abs(round(float(Credit) * 100))
+  elif Debit is not empty and float(Debit) != 0:
+      amount_cents = -abs(round(float(Debit) * 100))
+  else:
+      amount_cents = 0  # should not occur; log a warning
+
+notes: |
+  ING Business CSV export uses ISO 8601 dates (YYYY-MM-DD).
+  Column order differs from most Australian banks: Credit appears before Debit.
+  Both Credit and Debit are positive magnitudes — sign determined by column.
+  ING does not include a transaction reference column; construct the idempotency
+  key from date + description + amount_cents.

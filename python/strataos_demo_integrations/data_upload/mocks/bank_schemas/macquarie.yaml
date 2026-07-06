@@ -1,0 +1,31 @@
+# Macquarie Business Banking CSV export schema
+# Format: separate Debit and Credit columns (both positive numbers)
+# Date format: YYYY-MM-DD (ISO 8601)
+# Header rows to skip: 1
+
+bank: macquarie
+bank_name: Macquarie Bank Business Banking
+date_format: "%Y-%m-%d"
+skip_rows: 1
+amount_mode: split  # separate Debit and Credit columns
+
+columns:
+  date: Effective Date   # ISO 8601 date; column header contains a space
+  description: Description
+  debit: Debit            # positive number when money leaves the account; empty otherwise
+  credit: Credit           # positive number when money enters the account; empty otherwise
+  balance: Balance          # running balance after transaction
+
+amount_derivation: |
+  if Debit is not empty and float(Debit) != 0:
+      amount_cents = -abs(round(float(Debit) * 100))
+  elif Credit is not empty and float(Credit) != 0:
+      amount_cents = +abs(round(float(Credit) * 100))
+  else:
+      amount_cents = 0  # should not occur; log a warning
+
+notes: |
+  Macquarie Business Banking CSV export uses ISO 8601 dates (YYYY-MM-DD),
+  unlike most Australian banks which use DD/MM/YYYY — parse accordingly.
+  "Effective Date" is the settlement/value date, not the transaction initiation date.
+  Both Debit and Credit are positive magnitudes — sign is determined by column.

@@ -1,0 +1,23 @@
+# Westpac CSV export schema
+# Format: signed Amount column (negative = debit, positive = credit)
+# Date format: DD/MM/YYYY
+# Header rows to skip: 1
+
+bank: westpac
+bank_name: Westpac Banking Corporation
+date_format: "%d/%m/%Y"
+skip_rows: 1
+amount_mode: signed  # single signed Amount column; no separate Debit/Credit
+
+columns:
+  date: Date
+  amount: Amount        # signed float; negative = money out, positive = money in
+  description: Description
+  reference: Reference     # BSB/account reference or transaction reference number
+  balance: Balance       # running balance after transaction
+
+notes: |
+  Westpac Online Banking CSV export has a single header row.
+  The Reference column carries BSB-account or payee reference strings;
+  retain it verbatim as external_reference on the inbox envelope.
+  Amount is signed — convert to cents: round(float(Amount) * 100).

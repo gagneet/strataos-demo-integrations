@@ -1,0 +1,16 @@
+{
+  "name": "@strataos/demo-integrations-frontend",
+  "version": "0.1.0",
+  "description": "Extracted Data Upload and Strata Sync frontend pages for StrataOS",
+  "private": true,
+  "exports": {
+    "./strata-sync/StrataSyncPage": "./src/strata-sync/StrataSyncPage.jsx",
+    "./data-upload/FinancialYearImportPage": "./src/data-upload/FinancialYearImportPage.jsx",
+    "./data-upload/FinancialDataManagementPage": "./src/data-upload/FinancialDataManagementPage.jsx",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "next": "^16.0.0"
+  }
+}

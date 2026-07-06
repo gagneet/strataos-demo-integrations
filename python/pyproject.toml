@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strataos-demo-integrations"
+version = "0.1.0"
+requires-python = ">=3.12"
+description = "Extracted Data Upload, Strata Sync, and Demo Bank integrations for StrataOS"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+strataos_demo_integrations = [
+    "data_upload/mocks/bank_schemas/*.yaml",
+    "demo_bank/mocks/invoice_templates/*.txt",
+]

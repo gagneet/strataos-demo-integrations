@@ -1,0 +1,25 @@
+# NAB (National Australia Bank) CSV export schema
+# Format: signed Amount column (negative = debit, positive = credit)
+# Date format: DD/MM/YYYY
+# Header rows to skip: 1
+
+bank: nab
+bank_name: National Australia Bank
+date_format: "%d/%m/%Y"
+skip_rows: 1
+amount_mode: signed  # single signed Amount column; no separate Debit/Credit
+
+columns:
+  date: Date
+  amount: Amount          # signed float; negative = money out, positive = money in
+  description: Description
+  merchant_name: Merchant Name   # EFTPOS/card merchant name when applicable (may be empty)
+  merchant_city: Merchant City   # EFTPOS/card merchant city when applicable (may be empty)
+  balance: Balance         # running balance after transaction
+
+notes: |
+  NAB Internet Banking CSV export has a single header row.
+  Column names contain spaces — use quoted header matching.
+  Merchant Name and Merchant City are populated for card transactions only;
+  for EFT/direct credits they will be empty — treat as null rather than empty string.
+  Amount is signed — convert to cents: round(float(Amount) * 100).

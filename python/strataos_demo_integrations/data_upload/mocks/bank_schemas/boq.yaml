@@ -1,0 +1,32 @@
+# Bank of Queensland (BOQ) CSV export schema
+# Format: separate Debit and Credit columns (both positive numbers)
+# Date format: DD/MM/YYYY
+# Header rows to skip: 1
+
+bank: boq
+bank_name: Bank of Queensland
+date_format: "%d/%m/%Y"
+skip_rows: 1
+amount_mode: split  # separate Debit and Credit columns
+
+columns:
+  date: Date              # statement date of the row
+  transaction_date: Transaction Date  # effective/value date (may differ from Date)
+  description: Description
+  debit: Debit             # positive number when money leaves; empty otherwise
+  credit: Credit            # positive number when money enters; empty otherwise
+  balance: Balance           # running balance after transaction
+
+amount_derivation: |
+  if Debit is not empty and float(Debit) != 0:
+      amount_cents = -abs(round(float(Debit) * 100))
+  elif Credit is not empty and float(Credit) != 0:
+      amount_cents = +abs(round(float(Credit) * 100))
+  else:
+      amount_cents = 0  # should not occur; log a warning
+
+notes: |
+  BOQ CSV export includes two date columns: Date (statement date) and
+  Transaction Date (value/effective date). Use Transaction Date as the
+  canonical transaction date where available; fall back to Date if empty.
+  Both Debit and Credit are positive magnitudes — sign determined by column.

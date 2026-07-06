@@ -1,0 +1,37 @@
+# ANZ CSV export schema
+# Format: separate Debit and Credit columns (both positive numbers)
+# Date format: DD/MM/YYYY
+# Header rows to skip: 1
+
+bank: anz
+bank_name: ANZ Bank
+date_format: "%d/%m/%Y"
+skip_rows: 1
+amount_mode: split  # separate Debit and Credit columns
+
+columns:
+  date: Date
+  amount: ~              # not used directly; derived from Debit/Credit below
+  description: Description
+  debit: Debit          # positive number when money leaves the account; empty otherwise
+  credit: Credit         # positive number when money enters the account; empty otherwise
+  balance: Balance
+  category: Category       # ANZ-assigned spending category string (may be empty)
+  serial_number: Serial Number  # bank-assigned serial; use as external_reference
+
+amount_derivation: |
+  if Debit is not empty and float(Debit) != 0:
+      amount_cents = -abs(round(float(Debit) * 100))
+  elif Credit is not empty and float(Credit) != 0:
+      amount_cents = +abs(round(float(Credit) * 100))
+  else:
+      amount_cents = 0  # should not occur; log a warning
+
+notes: |
+  ANZ Internet Banking CSV has a header row (skip_rows: 1).
+  Both Debit and Credit are positive magnitudes — the sign is determined by
+  which column carries the value, not by a negative prefix.
+  Serial Number is the bank's own transaction serial; store as external_reference
+  for idempotency-key construction.
+  Category is informational only — do not map to internal spending categories
+  without user confirmation.

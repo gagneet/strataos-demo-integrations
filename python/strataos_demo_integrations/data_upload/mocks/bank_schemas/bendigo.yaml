@@ -1,0 +1,32 @@
+# Bendigo Bank CSV export schema
+# Format: separate Debit Amount and Credit Amount columns (both positive numbers)
+# Date format: DD/MM/YYYY
+# Header rows to skip: 1
+
+bank: bendigo
+bank_name: Bendigo and Adelaide Bank
+date_format: "%d/%m/%Y"
+skip_rows: 1
+amount_mode: split  # separate Debit Amount and Credit Amount columns
+
+columns:
+  date: Date
+  description: Transaction Description  # contains spaces in header
+  debit: Debit Amount             # positive number when money leaves; empty otherwise
+  credit: Credit Amount            # positive number when money enters; empty otherwise
+  balance: Balance
+  transaction_type: Transaction Type         # Bendigo-assigned type code (e.g. TFR, DD, CR)
+
+amount_derivation: |
+  if "Debit Amount" is not empty and float("Debit Amount") != 0:
+      amount_cents = -abs(round(float("Debit Amount") * 100))
+  elif "Credit Amount" is not empty and float("Credit Amount") != 0:
+      amount_cents = +abs(round(float("Credit Amount") * 100))
+  else:
+      amount_cents = 0  # should not occur; log a warning
+
+notes: |
+  Bendigo Bank CSV export uses multi-word column headers ("Transaction Description",
+  "Debit Amount", "Credit Amount", "Transaction Type") — use exact header matching.
+  Transaction Type is informational; map to internal categories only after user review.
+  Both debit and credit columns are positive magnitudes — sign determined by column.
