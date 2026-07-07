@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from sqlalchemy import text
-from db_postgres.session import async_session_context
+from db_postgres.session import async_session_context, set_tenant
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -127,10 +127,9 @@ async def seed() -> None:
         print(f"[seed] Demo tenant upserted: {DEMO_TENANT_ID}")
 
         # 2. Switch RLS context to the demo tenant for all writes inside it.
-        await session.execute(
-            text("SET LOCAL app.tenant_id = :tid"),
-            {"tid": DEMO_TENANT_ID}
-        )
+        # SET LOCAL does not accept bind parameters — use the shared helper,
+        # which is documented to be injection-safe for UUID values.
+        await set_tenant(session, DEMO_TENANT_ID)
 
         # 3. Demo scheme. Note: ``CAST(:jur AS …)`` avoids the SQLAlchemy
         #    ``:param::type`` parse-collision; the parser would otherwise drop
