@@ -30,8 +30,20 @@ from pathlib import Path
 import argparse
 import asyncio
 
-BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
-sys.path.insert(0, str(BACKEND_DIR))
+# This script runs as its own subprocess (launched by strata_sync/router.py via
+# subprocess.Popen), so it does NOT inherit the parent FastAPI process's sys.path —
+# it must locate the host app's backend/ directory itself. Since this package can be
+# pip-installed anywhere (see this repo's README), that location can't be derived from
+# this file's own path; the launching router passes it explicitly via env var.
+_backend_dir_env = os.environ.get("STRATAOS_BACKEND_DIR")
+if _backend_dir_env:
+    BACKEND_DIR = Path(_backend_dir_env)
+    sys.path.insert(0, str(BACKEND_DIR))
+else:
+    # Fallback for direct imports (e.g. scripts/strata/validate_scraper_parsing.py)
+    # that already put backend/ on sys.path themselves before importing this module.
+    import database as _host_database_module
+    BACKEND_DIR = Path(_host_database_module.__file__).resolve().parent
 
 from dotenv import load_dotenv
 

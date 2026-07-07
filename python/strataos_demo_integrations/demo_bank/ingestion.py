@@ -41,7 +41,7 @@ from strataos_demo_integrations.demo_bank.schemas import (
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_DIR = Path(__file__).parent.parent / "mocks" / "bank_schemas"
+_SCHEMA_DIR = Path(__file__).parent.parent / "data_upload" / "mocks" / "bank_schemas"
 
 # Regex patterns reused from csv_upload_bank_feed for signal extraction
 _CRN_RE = re.compile(r"\b(\d{13})\b")
@@ -743,7 +743,8 @@ async def _recompute_balance(db, building_id: str, account_ref: str) -> None:
             "total": {"$sum": "$amount_cents"},
         }},
     ]
-    totals = {doc["_id"]: doc["total"] async for doc in db._db.demo_bank_transactions.aggregate(pipeline)}
+    _agg_cursor = await db._db.demo_bank_transactions.aggregate(pipeline)
+    totals = {doc["_id"]: doc["total"] async for doc in _agg_cursor}
     credits = totals.get("credit", 0)
     debits = totals.get("debit", 0)
     current = opening + credits - debits

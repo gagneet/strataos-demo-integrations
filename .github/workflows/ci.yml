@@ -24,5 +24,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Check package.json is valid
-        run: node -e "require('./frontend/package.json')"
+      - name: Check package.json is valid and exports resolve
+        run: |
+          node -e "require('./package.json')"
+          node -e "require.resolve('./package.json').includes('/package.json') || process.exit(1)"
+          for f in $(node -e "console.log(Object.values(require('./package.json').exports).filter(p => p.endsWith('.jsx')).join(' '))"); do
+            test -f "$f" || { echo "Missing export target: $f"; exit 1; }
+          done

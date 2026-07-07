@@ -110,7 +110,7 @@ async def import_csv_endpoint(
 
     # Virus / content scan (no-op in dev if scanner not configured)
     try:
-        await scan_upload(content, file.filename or "upload.csv")
+        await scan_upload(content, context="csv", filename=file.filename or "upload.csv")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"File scan rejected upload: {exc}")
 
@@ -425,6 +425,6 @@ async def list_supported_banks(
 ) -> dict:
     """List bank schema names available for CSV upload."""
     from pathlib import Path
-    schema_dir = Path(__file__).parent.parent / "integrations" / "mocks" / "bank_schemas"
+    schema_dir = Path(__file__).parent.parent / "data_upload" / "mocks" / "bank_schemas"
     banks = sorted(p.stem for p in schema_dir.glob("*.yaml"))
     return {"banks": banks}

@@ -23,6 +23,7 @@ a dependency — not an independently deployable service.
 ## Layout
 
 ```
+package.json              # npm package root (name/exports) — see note below
 python/strataos_demo_integrations/
 ├── data_upload/   # Financial CSV bulk import (router, service, models) + CSV-upload mock bank feed
 ├── strata_sync/   # Portal browser-scraping sync ("Strata Sync" screen) + scraper subprocess script
@@ -33,6 +34,12 @@ frontend/src/
 ├── data-upload/   # FinancialYearImportPage, FinancialDataManagementPage
 └── strata-sync/   # StrataSyncPage
 ```
+
+Note: the npm `package.json` lives at the **repo root**, not under `frontend/`, even though its
+`exports` point into `frontend/src/`. Yarn/npm git dependencies (`github:owner/repo#tag`) always
+resolve to the repo root — unlike pip's `#subdirectory=` for the Python package above, there's no
+portable equivalent for npm on Yarn 1 (classic), so the root is the only place a consumer's package
+manager will find it.
 
 ## Consumed by
 

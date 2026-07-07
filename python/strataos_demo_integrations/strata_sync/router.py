@@ -19,6 +19,7 @@ import uuid
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -591,9 +592,17 @@ async def start_sync(
     # xvfb-run -a provides a virtual display so the browser can run with
     # headless=False, which avoids server-side headless detection by the portal.
     log_path = f"/tmp/strata_scraper_{job_id}.log"
+    # `database` is this repo's backend/database.py — already imported into this
+    # process, so its __file__ reliably locates the host app's backend/ directory
+    # regardless of where this package's own files live on disk (site-packages).
+    # The child is a fresh subprocess and won't inherit this process's sys.path,
+    # so run_scraper.py needs this env var to add backend/ to its own sys.path.
+    import database as _host_database_module
+    backend_dir = str(Path(_host_database_module.__file__).resolve().parent)
     child_env = {
         **os.environ,
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "STRATAOS_BACKEND_DIR": backend_dir,
     }
     subprocess.Popen(
         ["/usr/bin/xvfb-run", "-a", sys.executable, script_path, "--job-id", job_id, "--building-id", building_id],
