@@ -213,7 +213,7 @@ class ReconstructionManifest(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     manifest_hash: str  # sha256 over the canonical serialisation of this manifest
 
-    generated_at: datetime = Field(default_factory=lambda: datetime.now())
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     generated_by: Optional[str] = None
     supersedes_manifest_id: Optional[str] = None
 
