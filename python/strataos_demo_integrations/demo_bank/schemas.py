@@ -25,7 +25,30 @@ Direction = Literal["credit", "debit"]
 PaymentChannel = Literal["BPAY", "DEFT", "EFT", "CARD", "INTEREST", "FEE", "CHEQUE", "NPP", "OTHER"]
 TransactionStatus = Literal["posted", "pending", "reversed"]
 SyncStatus = Literal["pending", "synced", "failed", "ignored"]
-SourceType = Literal["csv_upload", "strata_web_payment", "manual", "seed"]
+# NOTE: "synthetic_from_budget" and "historical_mongo" are already live in production
+# data (East Gate migration_027) and already trusted by strata-management's
+# financial_matching.py:_PROMOTABLE_SOURCE_TYPES — kept here for consistency rather
+# than introduced. The five reconstruction_* values are new, added for the historical
+# reconstruction pipeline (see reconstruction_batch_schemas.py).
+SourceType = Literal[
+    "csv_upload", "strata_web_payment", "manual", "seed",
+    "synthetic_from_budget", "historical_mongo",
+    "historical_reconstruction", "agm_reconstruction",
+    "financial_statement_reconstruction", "owner_ledger_import",
+    "strata_platform_scrape",
+]
+# Coarser than SourceType — distinguishes "did StrataOS observe this at a real bank"
+# from "did StrataOS model/reconstruct this transaction". Every demo_bank_transactions
+# document should carry one going forward; existing rows may have it absent (treat
+# missing as unknown, not as observed_bank_feed).
+TransactionOrigin = Literal[
+    "observed_bank_feed", "imported_bank_statement", "migrated_owner_ledger",
+    "reconstructed_historical", "demo_seed", "manual_adjustment",
+]
+# Ordinary levies vs a special levy raised outside the normal quarterly cycle.
+# Matching-clarity field only — the Postgres levy obligation-level classification
+# lives on finance.levy_runs.levy_run_type in strata-management, not here.
+LevyComponent = Literal["ordinary", "special_levy"]
 ImportStatus = Literal["pending", "completed", "failed", "partial"]
 
 
@@ -118,6 +141,12 @@ class DemoBankTransactionResponse(BaseModel):
     evidence_document_id: Optional[str]
     is_test_data: bool
     created_at: datetime
+    # ── Reconstruction provenance (optional — absent on observed/manual/CSV rows) ──
+    transaction_origin: Optional[TransactionOrigin] = None
+    reconstruction_batch_id: Optional[str] = None
+    reconstruction_version: Optional[int] = None
+    assumption_code: Optional[str] = None
+    levy_component: Optional[LevyComponent] = None
 
 
 class TransactionListResponse(BaseModel):
