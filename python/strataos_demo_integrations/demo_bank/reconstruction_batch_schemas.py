@@ -114,7 +114,7 @@ class ReconstructionBatch(BaseModel):
     created_by: Optional[str] = None
     reviewed_by: Optional[str] = None
     approved_by: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     reviewed_at: Optional[datetime] = None
     approved_at: Optional[datetime] = None
     posted_at: Optional[datetime] = None
