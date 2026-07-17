@@ -33,6 +33,10 @@ from typing import Optional
 
 from bson import ObjectId
 
+from strataos_demo_integrations.demo_bank.reconstruction_batch_schemas import (
+    ReconstructionBatch,
+    ReconstructionManifest,
+)
 from strataos_demo_integrations.demo_bank.schemas import (
     PROVIDER,
     ImportStatus,
@@ -554,6 +558,134 @@ def _extract_strata_web_payments(snapshot: dict, building_id: str) -> list[dict]
     return result
 
 
+# ── Historical reconstruction ingestion ─────────────────────────────────────────
+#
+# Distinct from the CSV/Strata-Web direct-ingestion paths above: this entrypoint
+# never sees a raw source row. It only ever writes rows that already exist inside
+# an approved, immutable ReconstructionManifest (built by the caller from budget/
+# AGM/audited-statement facts, GST/UOE apportionment, and payment-pattern
+# modelling — none of which happens in this file). It must never recompute an
+# amount or a date; every value comes verbatim from manifest.transactions.
+#
+# This does NOT touch or weaken the Strata Web guard above — that guard protects
+# a different, direct-ingestion code path (raw snapshot rows that must never
+# become bank transactions unless they already carry a dated payment amount).
+# Reconstruction ingestion is for facts that were never bank transactions in the
+# first place and were deliberately, reviewably, modelled into them.
+
+_MANIFEST_ELIGIBLE_BATCH_STATUSES = frozenset({"approved", "generation_ready"})
+
+
+async def import_historical_reconstruction(
+    db,
+    building_id: str,
+    batch: ReconstructionBatch,
+    manifest: ReconstructionManifest,
+) -> dict:
+    """Materialise every row in an approved ReconstructionManifest as a Demo Bank txn.
+
+    Refuses unless `batch.status` has passed approval (`approved` or
+    `generation_ready`) — a defense-in-depth check independent of whatever gate
+    the calling orchestrator (strata-management's reconstruction_batch_service)
+    already applied. Every row is upserted via the same `_upsert_transaction()`
+    used by CSV/Strata-Web ingestion, so it inherits the same idempotent
+    `$setOnInsert` behaviour — replaying the same manifest twice is a no-op.
+
+    Returns a dict shaped like ImportResultResponse plus a `batch_id` field.
+    """
+    if batch.batch_id != manifest.batch_id:
+        raise ValueError(
+            f"Manifest {manifest.manifest_id} belongs to batch {manifest.batch_id}, "
+            f"not the supplied batch {batch.batch_id}."
+        )
+    if batch.building_id != building_id:
+        raise ValueError(
+            f"Batch {batch.batch_id} belongs to building {batch.building_id}, "
+            f"not the requested building {building_id}."
+        )
+    if batch.status not in _MANIFEST_ELIGIBLE_BATCH_STATUSES:
+        raise ValueError(
+            f"Batch {batch.batch_id} has status={batch.status!r}; historical "
+            f"reconstruction rows may only be materialised for a batch in "
+            f"{sorted(_MANIFEST_ELIGIBLE_BATCH_STATUSES)}."
+        )
+    if not manifest.transactions:
+        return {
+            "batch_id": batch.batch_id,
+            "import_status": "completed",
+            "imported_count": 0,
+            "skipped_count": 0,
+            "error_count": 0,
+            "duplicate_batch": False,
+            "message": "Manifest contains no transactions — nothing to materialise.",
+        }
+
+    imported = skipped = errors = 0
+    touched_account_refs: set[str] = set()
+
+    for row in manifest.transactions:
+        try:
+            upserted = await _upsert_transaction(
+                db=db,
+                building_id=building_id,
+                account_ref=row.account_ref,
+                source_type="historical_reconstruction",
+                source_batch_id=batch.batch_id,
+                is_test_data=batch.is_test_data,
+                posted_date=datetime.combine(row.posted_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+                effective_date=datetime.combine(row.posted_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+                amount_cents=row.amount_cents,
+                direction=row.direction,
+                description=row.description,
+                reference=None,
+                payer_name=None,
+                payment_channel="OTHER",
+                running_balance_cents=None,
+                confidence="high",
+                provenance_class="reconstruction",
+                evidence_type="historical_reconstruction_manifest",
+                formula_version=manifest.generator_version,
+                source_snapshot_ids=list(manifest.input_document_hashes),
+                requires_review=False,
+                date_basis="reconstructed_from_approved_manifest",
+                unit_number=row.unit_number,
+                transaction_origin="reconstructed_historical",
+                reconstruction_batch_id=batch.batch_id,
+                reconstruction_version=manifest.version,
+                assumption_code=row.assumption_code,
+                levy_component=row.levy_component,
+            )
+            touched_account_refs.add(row.account_ref)
+            if upserted:
+                imported += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            logger.warning(
+                "Demo Bank reconstruction row error (building=%s batch=%s unit=%s): %s",
+                building_id, batch.batch_id, row.unit_number, exc,
+            )
+            errors += 1
+
+    for account_ref in touched_account_refs:
+        await _recompute_balance(db, building_id, account_ref)
+
+    status: ImportStatus = "completed" if errors == 0 else ("partial" if imported > 0 else "failed")
+    return {
+        "batch_id": batch.batch_id,
+        "import_status": status,
+        "imported_count": imported,
+        "skipped_count": skipped,
+        "error_count": errors,
+        "duplicate_batch": False,
+        "message": (
+            f"Historical reconstruction: {imported} transactions materialised "
+            f"({skipped} already existed, {errors} errors) from manifest "
+            f"{manifest.manifest_id} v{manifest.version}."
+        ),
+    }
+
+
 # ── Manual injection ──────────────────────────────────────────────────────────
 
 async def inject_manual(
@@ -622,7 +754,7 @@ async def _upsert_transaction(
     building_id: str,
     account_ref: str,
     source_type: str,
-    source_batch_id: Optional[ObjectId],
+    source_batch_id: Optional[ObjectId | str],
     is_test_data: bool,
     posted_date: datetime,
     effective_date: datetime,
@@ -653,6 +785,14 @@ async def _upsert_transaction(
     # on lot_ref_raw regex extraction, which is only appropriate for real,
     # free-text bank descriptions.
     unit_number: Optional[str] = None,
+    # ── Historical-reconstruction batch/manifest linkage (additive) ──────────
+    # Populated only by import_historical_reconstruction(). Left at their safe
+    # defaults (None) for every existing call site (CSV/Strata-Web/manual).
+    transaction_origin: Optional[str] = None,
+    reconstruction_batch_id: Optional[str] = None,
+    reconstruction_version: Optional[int] = None,
+    assumption_code: Optional[str] = None,
+    levy_component: Optional[str] = None,
 ) -> bool:
     """Upsert one demo_bank_transaction. Returns True if a new document was inserted."""
     ext_id = _external_txn_id(
@@ -705,6 +845,11 @@ async def _upsert_transaction(
         "supersedes_event_id": supersedes_event_id,
         "requires_review": requires_review,
         "date_basis": date_basis,
+        "transaction_origin": transaction_origin,
+        "reconstruction_batch_id": reconstruction_batch_id,
+        "reconstruction_version": reconstruction_version,
+        "assumption_code": assumption_code,
+        "levy_component": levy_component,
         "created_at": _now(),
     }
 

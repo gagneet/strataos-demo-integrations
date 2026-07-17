@@ -216,6 +216,22 @@ class DemoBankFeed:
         if posted_date.tzinfo is None:
             posted_date = posted_date.replace(tzinfo=timezone.utc)
 
+        # Phase 0B provenance contract: populate the envelope's optional metadata
+        # field whenever the Mongo document carries reconstruction provenance, so
+        # strata-management's bank_feeds.py no longer strictly needs its Mongo
+        # side-channel lookup to preserve it — this provider now emits everything
+        # a reconstruction-aware consumer needs directly in BankTxObserved.
+        metadata: Optional[dict] = None
+        if doc.get("transaction_origin") or doc.get("reconstruction_batch_id"):
+            metadata = {
+                "transaction_origin": doc.get("transaction_origin"),
+                "reconstruction_batch_id": doc.get("reconstruction_batch_id"),
+                "reconstruction_version": doc.get("reconstruction_version"),
+                "assumption_code": doc.get("assumption_code"),
+                "levy_component": doc.get("levy_component"),
+                "source_document_ids": doc.get("source_snapshot_ids") or [],
+            }
+
         return BankTxObserved(
             provider_txn_id=doc["external_transaction_id"],
             tenant_id=doc["building_id"],
@@ -228,6 +244,7 @@ class DemoBankFeed:
             osko_e2e_id=osko_e2e_id,
             lot_ref_raw=lot_ref_raw,
             is_test_data=bool(doc.get("is_test_data", False)),
+            metadata=metadata,
         )
 
     async def verify_webhook(
