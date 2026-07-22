@@ -316,8 +316,20 @@ class TestSignedAmounts:
                     {"status": {"$in": ["posted", "pending"]}},
                     {"status": {"$exists": False}},
                 ]},
+                {"source_type": {"$ne": "synthetic_from_budget"}},
             ]
         }
+
+    def test_syncable_filter_excludes_synthetic_from_budget(self):
+        """East Gate 13195 investigation (2026-07-22): 3,828 of East Gate's 4,560
+        Demo Bank staging rows (84%) are source_type="synthetic_from_budget" —
+        fabricated payments (amount = unit_uoe x levy_per_uoe_quarterly with a
+        randomized payment date), not observed bank movements. They must never
+        be pulled into a provider sync regardless of their status field."""
+        from strataos_demo_integrations.demo_bank.provider import _syncable_transaction_filter
+
+        query = _syncable_transaction_filter(datetime(2021, 1, 1, tzinfo=timezone.utc))
+        assert {"source_type": {"$ne": "synthetic_from_budget"}} in query["$and"]
 
     def test_zero_amount_credit_stays_non_negative(self):
         from strataos_demo_integrations.demo_bank.provider import DemoBankFeed
