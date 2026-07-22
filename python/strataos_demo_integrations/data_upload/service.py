@@ -19,6 +19,35 @@ from utils.finance_helpers import get_levy_rate_breakdown
 _MAX_ROWS = 500
 
 
+def _year_int_or_none(year: str):
+    try:
+        return int(str(year)[:4])
+    except (TypeError, ValueError):
+        return None
+
+
+async def _current_levy_year(building_id: str, settings_doc: dict | None = None) -> int:
+    """The calendar year that is CURRENT for this building's own levy cycle today.
+
+    Mirrors routers.finance._resolve_current_levy_year's formula deliberately
+    without importing that function: it calls services.settings_service.
+    get_general_settings without skip_pg=True, i.e. it tries a PostgreSQL read
+    first. This module only ever writes to legacy Mongo collections
+    (annual_levies, levy_categories, unit_levy_ledger) — no other code path
+    here touches Postgres — so pulling in a PG dependency for a pure
+    year-validation check would be an unrelated, untested regression (and
+    would break every existing pure-Mongo-mock test in this suite). skip_pg=True
+    keeps this Mongo-only, consistent with the rest of the file.
+    """
+    if settings_doc is None:
+        settings_doc = await get_general_settings_or_default(
+            building_id, {"_id": 0, "financial_year_start_month": 1}, settings_db=db, skip_pg=True,
+        )
+    fy_start_month = int((settings_doc or {}).get("financial_year_start_month") or 1)
+    now = datetime.now(timezone.utc)
+    return now.year if (fy_start_month <= 1 or now.month >= fy_start_month) else now.year - 1
+
+
 def _parse_float(val: str) -> float:
     """Parse float from string, stripping $, commas, spaces."""
     if not val:
@@ -130,6 +159,12 @@ async def process_annual_levy_csv(content: bytes, building_id: str, created_by: 
     result.total_rows = len(rows)
     now = datetime.now(timezone.utc).isoformat()
     settings_doc = await get_general_settings_or_default(building_id, {"_id": 0}, settings_db=db)
+    # East Gate 13195 investigation (2026-07-22): this endpoint had zero year
+    # validation at all — the confirmed root cause of a phantom FY2027
+    # annual_levies/unit_levy_ledger/levy_categories batch. A future levy year is
+    # legitimate for a proposed/draft budget (e.g. AGM-adopted next-year budget)
+    # but never for status="actual" — resolved once per upload, not per row.
+    current_levy_year = await _current_levy_year(building_id, settings_doc=settings_doc)
 
     for i, row in enumerate(rows, 1):
         try:
@@ -190,6 +225,16 @@ async def process_annual_levy_csv(content: bytes, building_id: str, created_by: 
             total_income_proposed = admin_income_proposed + sinking_income_proposed
             has_actuals = admin_levy_actual is not None or admin_exp_actual is not None
             status = "actual" if has_actuals else "proposed"
+
+            year_int = _year_int_or_none(year)
+            if year_int is not None and year_int > current_levy_year and status == "actual":
+                result.errors.append(
+                    f"Row {i}: financial_year={year} is beyond the building's current "
+                    f"levy year ({current_levy_year}) with actual figures present — "
+                    f"future years may only be imported as proposed/draft budgets"
+                )
+                result.skipped += 1
+                continue
 
             # Single query: check if record exists AND retrieve total_uoe in one call.
             # Never hardcode total_uoe=10000 — Sierra=9, Harbourview=3.
@@ -314,6 +359,9 @@ async def process_budget_categories_csv(content: bytes, building_id: str, create
     rows = rows[:_MAX_ROWS]
     result.total_rows = len(rows)
     now = datetime.now(timezone.utc).isoformat()
+    # East Gate 13195 investigation (2026-07-22): see process_annual_levy_csv —
+    # same missing-validation root cause, same fix. Resolved once per upload.
+    current_levy_year = await _current_levy_year(building_id)
 
     for i, row in enumerate(rows, 1):
         try:
@@ -335,6 +383,16 @@ async def process_budget_categories_csv(content: bytes, building_id: str, create
             actual = _parse_float(actual_raw) if actual_raw else None
             description = row.get("description", "").strip() or None
             status = "actual" if actual is not None else "proposed"
+
+            year_int = _year_int_or_none(year)
+            if year_int is not None and year_int > current_levy_year and status == "actual":
+                result.errors.append(
+                    f"Row {i}: financial_year={year} is beyond the building's current "
+                    f"levy year ({current_levy_year}) with an actual_amount present — "
+                    f"future years may only be imported as proposed budget categories"
+                )
+                result.skipped += 1
+                continue
 
             cat_doc = {
                 "year": year,
@@ -389,6 +447,13 @@ async def process_unit_levy_status_csv(
     rows = rows[:_MAX_ROWS]
     result.total_rows = len(rows)
     now = datetime.now(timezone.utc).isoformat()
+    # East Gate 13195 investigation (2026-07-22): unlike the budget/levy-schedule
+    # CSVs above, this endpoint writes unit_levy_ledger — actual per-unit
+    # levied/paid figures, a payment-shaped fact with no "proposed" concept — so
+    # a future levy year is never legitimate here, regardless of any status field.
+    # This is the confirmed source of East Gate's 87-document phantom "2027"
+    # unit_levy_ledger batch.
+    current_levy_year = await _current_levy_year(building_id)
 
     for i, row in enumerate(rows, 1):
         try:
@@ -400,6 +465,16 @@ async def process_unit_levy_status_csv(
 
             if not unit_number or not year:
                 result.errors.append(f"Row {i}: missing unit_number or financial_year")
+                result.skipped += 1
+                continue
+
+            year_int = _year_int_or_none(year)
+            if year_int is not None and year_int > current_levy_year:
+                result.errors.append(
+                    f"Row {i}: financial_year={year} is beyond the building's current "
+                    f"levy year ({current_levy_year}) — unit levy ledger data cannot be "
+                    f"imported for a future year"
+                )
                 result.skipped += 1
                 continue
 

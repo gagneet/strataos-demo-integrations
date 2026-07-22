@@ -433,6 +433,48 @@ class TestProcessAnnualLevy:
         assert result.skipped == 1
         assert "total_uoe" in result.errors[0]
 
+    def test_future_year_with_actuals_rejected(self, mock_db):
+        """East Gate 13195 investigation (2026-07-22): this endpoint had zero year
+        validation at all — confirmed root cause of a phantom FY2027 annual_levies
+        row (data_source="scraper_import", is_synthetic=True) that shouldn't have
+        existed since the building's real current levy year was 2026. A future
+        year with actual figures present must be rejected, not silently imported."""
+        csv_data = _csv(
+            "financial_year,admin_levy_per_uoe_proposed,admin_levy_per_uoe_actual,"
+            "sinking_levy_per_uoe_proposed,admin_total_income_proposed,admin_total_expenses_proposed,"
+            "admin_opening_balance,admin_closing_balance_projected,admin_total_expenses_actual,"
+            "sinking_total_income_proposed,sinking_total_expenses_proposed,sinking_opening_balance,"
+            "sinking_closing_balance_projected\n"
+            "2099,999.00,23.10,888.00,309882.00,309882.00,15000.00,15000.00,335000.00,90459.00,45000.00,85000.00,139504.90\n"
+        )
+        from strataos_demo_integrations.data_upload.service import process_annual_levy_csv
+        result = asyncio.get_event_loop().run_until_complete(
+            process_annual_levy_csv(csv_data, BUILDING_ID, CREATED_BY)
+        )
+        assert result.imported == 0
+        assert result.updated == 0
+        assert result.skipped == 1
+        assert "2099" in result.errors[0]
+        mock_db.annual_levies.insert_one.assert_not_awaited()
+
+    def test_future_year_proposed_budget_allowed(self, mock_db):
+        """A future levy year with no actuals (a proposed/draft budget — e.g. an
+        AGM-adopted next-year budget) is legitimate and must still import."""
+        csv_data = _csv(
+            "financial_year,admin_levy_per_uoe_proposed,sinking_levy_per_uoe_proposed,"
+            "admin_total_income_proposed,admin_total_expenses_proposed,admin_opening_balance,"
+            "sinking_total_income_proposed,sinking_total_expenses_proposed,sinking_opening_balance\n"
+            "2099,999.00,888.00,309882.00,309882.00,15000.00,90459.00,45000.00,85000.00\n"
+        )
+        mock_db.annual_levies.find_one = AsyncMock(return_value=None)
+        from strataos_demo_integrations.data_upload.service import process_annual_levy_csv
+        result = asyncio.get_event_loop().run_until_complete(
+            process_annual_levy_csv(csv_data, BUILDING_ID, CREATED_BY)
+        )
+        assert result.imported == 1
+        assert result.skipped == 0
+        assert result.errors == []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. process_budget_categories_csv
@@ -459,6 +501,9 @@ class TestProcessBudgetCategories:
             mock.levy_categories.find_one = AsyncMock(return_value=None)
             mock.levy_categories.insert_one = AsyncMock()
             mock.levy_categories.update_one = AsyncMock()
+            # process_budget_categories_csv now calls _current_levy_year() (East
+            # Gate 13195 investigation, 2026-07-22), which reads db.settings.
+            mock.settings.find_one = AsyncMock(return_value={})
             yield mock
 
     def test_imports_three_categories(self, mock_db):
@@ -530,6 +575,32 @@ class TestProcessBudgetCategories:
         filter_arg = mock_db.levy_categories.update_one.call_args_list[0][0][0]
         assert filter_arg["building_id"] == BUILDING_ID
 
+    def test_future_year_with_actual_amount_rejected(self, mock_db):
+        """East Gate 13195 investigation (2026-07-22): part of the same phantom
+        FY2027 batch as annual_levies — 46 levy_categories docs (data_source=
+        "scraper") existed for a year beyond the building's real current levy
+        year. A future year with an actual_amount present must be rejected."""
+        csv_data = _csv("financial_year,category_name,fund_type,budgeted_amount,actual_amount\n"
+                         "2099,Cleaning,admin,1000,900\n")
+        from strataos_demo_integrations.data_upload.service import process_budget_categories_csv
+        result = asyncio.get_event_loop().run_until_complete(
+            process_budget_categories_csv(csv_data, BUILDING_ID, CREATED_BY)
+        )
+        assert result.imported == 0
+        assert result.skipped == 1
+        assert "2099" in result.errors[0]
+        mock_db.levy_categories.insert_one.assert_not_awaited()
+
+    def test_future_year_proposed_category_allowed(self, mock_db):
+        csv_data = _csv("financial_year,category_name,fund_type,budgeted_amount\n"
+                         "2099,Cleaning,admin,1000\n")
+        from strataos_demo_integrations.data_upload.service import process_budget_categories_csv
+        result = asyncio.get_event_loop().run_until_complete(
+            process_budget_categories_csv(csv_data, BUILDING_ID, CREATED_BY)
+        )
+        assert result.imported == 1
+        assert result.skipped == 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. process_unit_levy_status_csv
@@ -550,6 +621,9 @@ class TestProcessUnitLevyStatus:
             mock.unit_levy_ledger.insert_one = AsyncMock()
             mock.unit_levy_ledger.update_one = AsyncMock()
             mock.units.find_one = AsyncMock(return_value={"unit_entitlement": 115})
+            # process_unit_levy_status_csv now calls _current_levy_year() (East
+            # Gate 13195 investigation, 2026-07-22), which reads db.settings.
+            mock.settings.find_one = AsyncMock(return_value={})
             yield mock
 
     def test_imports_two_rows(self, mock_db):
@@ -644,6 +718,25 @@ class TestProcessUnitLevyStatus:
             process_unit_levy_status_csv(csv_data, BUILDING_ID, CREATED_BY)
         )
         assert result.skipped == 1
+
+    def test_future_year_rejected_unconditionally(self, mock_db):
+        """East Gate 13195 investigation (2026-07-22): confirmed root cause of a
+        phantom 87-document FY2027 unit_levy_ledger batch (data_source="scraper").
+        Unlike annual_levy/budget_categories, this collection holds actual
+        levied/paid figures with no "proposed" concept — a future year is never
+        legitimate here, regardless of any status field."""
+        csv_data = _csv(
+            "lot_number,unit_number,financial_year,admin_levied,admin_paid,sinking_levied,sinking_paid\n"
+            "LOT1,UA001,2099,2345.00,2345.00,672.00,672.00\n"
+        )
+        from strataos_demo_integrations.data_upload.service import process_unit_levy_status_csv
+        result = asyncio.get_event_loop().run_until_complete(
+            process_unit_levy_status_csv(csv_data, BUILDING_ID, CREATED_BY)
+        )
+        assert result.imported == 0
+        assert result.skipped == 1
+        assert "2099" in result.errors[0]
+        mock_db.unit_levy_ledger.insert_one.assert_not_awaited()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -839,6 +932,7 @@ class TestBuildingIsolation:
         with patch("strataos_demo_integrations.data_upload.service.db") as mock_db:
             mock_db.levy_categories.find_one = AsyncMock(return_value=None)
             mock_db.levy_categories.insert_one = AsyncMock()
+            mock_db.settings.find_one = AsyncMock(return_value={})
             from strataos_demo_integrations.data_upload.service import process_budget_categories_csv
             asyncio.get_event_loop().run_until_complete(
                 process_budget_categories_csv(
@@ -870,6 +964,7 @@ class TestBuildingIsolation:
             mock_db.unit_levy_ledger.find_one = AsyncMock(return_value=None)
             mock_db.unit_levy_ledger.insert_one = AsyncMock()
             mock_db.units.find_one = AsyncMock(return_value=None)
+            mock_db.settings.find_one = AsyncMock(return_value={})
             from strataos_demo_integrations.data_upload.service import process_unit_levy_status_csv
             asyncio.get_event_loop().run_until_complete(
                 process_unit_levy_status_csv(
