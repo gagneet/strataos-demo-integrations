@@ -134,7 +134,23 @@ class ReconstructionBatch(BaseModel):
 
 
 class ReconstructedTransactionRow(BaseModel, frozen=True):
-    """One planned Demo Bank transaction inside a manifest — not yet written anywhere."""
+    """One planned fund-allocation LINE inside a manifest — not yet written anywhere.
+
+    A row is per-fund by design (fund_type is a single value), matching finance.
+    receipt_allocations' shape. Rows that represent the SAME real (or realistically
+    modelled) payment event share a `payment_group_id` — e.g. one owner's combined
+    admin+sinking+GST quarterly payment is two rows (fund_type="admin",
+    fund_type="sinking") with the same payment_group_id. The materialisation step
+    (ingestion.import_historical_reconstruction()) collapses rows sharing a
+    payment_group_id into ONE Demo Bank transaction (one bank credit, matching
+    finance.receipts' single-header shape) with per-fund allocation metadata,
+    rather than writing one Demo Bank row per fund — see
+    financial-db-issues_plan04.md point 5: owners do not make separate admin/
+    sinking/GST payments; that split is an allocation detail, not separate cash
+    movements. payment_group_id=None (the default) means this row was never
+    evidenced as sharing a payment with anything else — it materialises as its
+    own single-line Demo Bank transaction, unchanged from prior behaviour.
+    """
 
     account_ref: str
     unit_number: str
@@ -150,6 +166,7 @@ class ReconstructedTransactionRow(BaseModel, frozen=True):
     assumption_code: str  # e.g. "quarterly_regular", "annual_lump_sum", "arrears_catch_up"
     description: str
     transaction_sequence: int  # disambiguates repeats within the same (unit, year, quarter, component)
+    payment_group_id: Optional[str] = None  # rows sharing this value collapse into one Demo Bank txn
 
 
 class YearFundReconciliationLine(BaseModel, frozen=True):

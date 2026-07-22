@@ -243,6 +243,96 @@ class TestIdempotentReplay:
         db._db.demo_bank_transactions.update_one.assert_not_called()
 
 
+# ── 4b. payment_group_id collapsing (financial-db-issues_plan04.md point 5) ──
+
+class TestPaymentGroupCollapsing:
+    """Owners make ONE combined payment, not separate admin/sinking transactions —
+    rows sharing a payment_group_id must materialise as ONE Demo Bank transaction
+    with allocation lines, never as separate per-fund bank credits."""
+
+    @pytest.mark.asyncio
+    async def test_grouped_rows_collapse_into_one_transaction(self):
+        from strataos_demo_integrations.demo_bank.ingestion import import_historical_reconstruction
+
+        db = _make_db()
+        admin_row = _row(
+            unit_number="87", fund_type="admin", amount_cents=55475, amount_ex_gst_cents=50432,
+            gst_cents=5043, transaction_sequence=1, payment_group_id="grp-87-2023-Q1",
+            description="Reconstructed Q1 2023 admin — Unit 87",
+        )
+        sinking_row = _row(
+            unit_number="87", fund_type="sinking", amount_cents=16763, amount_ex_gst_cents=15239,
+            gst_cents=1524, transaction_sequence=2, payment_group_id="grp-87-2023-Q1",
+            description="Reconstructed Q1 2023 sinking — Unit 87",
+        )
+        manifest = _manifest(
+            transactions=[admin_row, sinking_row], expected_transaction_count=2,
+            expected_credit_cents=55475 + 16763,
+        )
+
+        result = await import_historical_reconstruction(db, _BUILDING_A, _batch(), manifest)
+
+        assert result["imported_count"] == 1  # ONE transaction, not two
+        assert result["error_count"] == 0
+        assert db._db.demo_bank_transactions.update_one.call_count == 1
+
+        doc = db._db.demo_bank_transactions.update_one.call_args_list[0].args[1]["$setOnInsert"]
+        assert doc["amount_cents"] == 55475 + 16763
+        assert len(doc["allocations"]) == 2
+        alloc_by_fund = {a["fund_type"]: a for a in doc["allocations"]}
+        assert alloc_by_fund["admin"]["amount_cents"] == 55475
+        assert alloc_by_fund["admin"]["gst_cents"] == 5043
+        assert alloc_by_fund["sinking"]["amount_cents"] == 16763
+        assert alloc_by_fund["sinking"]["gst_cents"] == 1524
+        # Sum of allocation lines must equal the header amount — no cent lost/gained in grouping.
+        assert sum(a["amount_cents"] for a in doc["allocations"]) == doc["amount_cents"]
+
+    @pytest.mark.asyncio
+    async def test_ungrouped_rows_remain_separate_transactions(self):
+        """payment_group_id=None (the default) — unchanged materialisation count:
+        one Demo Bank transaction per row (never merged with another row). Each
+        still carries a single-item allocations line describing its own fund —
+        every materialised transaction has a consistent allocations shape,
+        whether it came from a group of one or a group of many."""
+        from strataos_demo_integrations.demo_bank.ingestion import import_historical_reconstruction
+
+        db = _make_db()
+        rows = [
+            _row(unit_number="1", transaction_sequence=1),  # payment_group_id defaults to None
+            _row(unit_number="2", transaction_sequence=1),
+        ]
+        manifest = _manifest(transactions=rows, expected_transaction_count=2, expected_credit_cents=220000)
+
+        result = await import_historical_reconstruction(db, _BUILDING_A, _batch(), manifest)
+
+        assert result["imported_count"] == 2
+        docs = [c.args[1]["$setOnInsert"] for c in db._db.demo_bank_transactions.update_one.call_args_list]
+        for d in docs:
+            assert len(d["allocations"]) == 1
+            assert d["allocations"][0]["amount_cents"] == d["amount_cents"]
+
+    @pytest.mark.asyncio
+    async def test_inconsistent_group_is_skipped_not_silently_merged(self):
+        """Two rows sharing a payment_group_id but disagreeing on unit_number is a
+        generator bug (grouping is meant to be scoped to one unit's one payment
+        event) — must be rejected as an error, never silently merged onto
+        whichever row happened to be first."""
+        from strataos_demo_integrations.demo_bank.ingestion import import_historical_reconstruction
+
+        db = _make_db()
+        rows = [
+            _row(unit_number="1", transaction_sequence=1, payment_group_id="grp-bad"),
+            _row(unit_number="2", transaction_sequence=2, payment_group_id="grp-bad"),
+        ]
+        manifest = _manifest(transactions=rows, expected_transaction_count=2)
+
+        result = await import_historical_reconstruction(db, _BUILDING_A, _batch(), manifest)
+
+        assert result["imported_count"] == 0
+        assert result["error_count"] == 2
+        db._db.demo_bank_transactions.update_one.assert_not_called()
+
+
 # ── 5. Strata Web guard remains untouched ─────────────────────────────────────
 
 class TestStrataWebGuardUnmodified:

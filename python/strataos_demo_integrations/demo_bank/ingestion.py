@@ -623,20 +623,74 @@ async def import_historical_reconstruction(
     imported = skipped = errors = 0
     touched_account_refs: set[str] = set()
 
+    # Group rows sharing a payment_group_id into ONE Demo Bank transaction each
+    # (financial-db-issues_plan04.md point 5 — owners make one combined payment,
+    # not separate admin/sinking/GST payments). A row with payment_group_id=None
+    # is its own single-row group, matching prior (pre-grouping) behaviour exactly.
+    groups: dict[Any, list] = {}
+    ungrouped_counter = 0
     for row in manifest.transactions:
+        if row.payment_group_id is not None:
+            key = row.payment_group_id
+        else:
+            ungrouped_counter += 1
+            key = f"__ungrouped_{ungrouped_counter}"
+        groups.setdefault(key, []).append(row)
+
+    for group_key, rows in groups.items():
+        first = rows[0]
+        mismatched = [
+            r for r in rows
+            if (r.account_ref, r.unit_number, r.posted_date, r.direction) !=
+               (first.account_ref, first.unit_number, first.posted_date, first.direction)
+        ]
+        if mismatched:
+            logger.warning(
+                "Demo Bank reconstruction group %r has inconsistent account_ref/unit_number/"
+                "posted_date/direction across its rows (building=%s batch=%s) — skipping group, "
+                "not guessing which value is authoritative.",
+                group_key, building_id, batch.batch_id,
+            )
+            errors += len(rows)
+            continue
+
+        total_amount_cents = sum(r.amount_cents for r in rows)
+        total_ex_gst_cents = sum(r.amount_ex_gst_cents for r in rows)
+        total_gst_cents = sum(r.gst_cents for r in rows)
+        allocations = [
+            {
+                "fund_type": r.fund_type,
+                "levy_component": r.levy_component,
+                "amount_cents": r.amount_cents,
+                "amount_ex_gst_cents": r.amount_ex_gst_cents,
+                "gst_cents": r.gst_cents,
+                "assumption_code": r.assumption_code,
+            }
+            for r in rows
+        ]
+        # Single fund_type/levy_component/assumption_code only when every row in
+        # the group agrees — a genuinely combined (e.g. admin+sinking) group has
+        # no single answer for these, so they stay per-allocation-line only.
+        fund_types = {r.fund_type for r in rows}
+        levy_components = {r.levy_component for r in rows}
+        assumption_codes = {r.assumption_code for r in rows}
+        description = first.description if len(rows) == 1 else (
+            f"{first.description} (combined: " + ", ".join(sorted(fund_types)) + ")"
+        )
+
         try:
             upserted = await _upsert_transaction(
                 db=db,
                 building_id=building_id,
-                account_ref=row.account_ref,
+                account_ref=first.account_ref,
                 source_type="historical_reconstruction",
                 source_batch_id=batch.batch_id,
                 is_test_data=batch.is_test_data,
-                posted_date=datetime.combine(row.posted_date, datetime.min.time()).replace(tzinfo=timezone.utc),
-                effective_date=datetime.combine(row.posted_date, datetime.min.time()).replace(tzinfo=timezone.utc),
-                amount_cents=row.amount_cents,
-                direction=row.direction,
-                description=row.description,
+                posted_date=datetime.combine(first.posted_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+                effective_date=datetime.combine(first.posted_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+                amount_cents=total_amount_cents,
+                direction=first.direction,
+                description=description,
                 reference=None,
                 payer_name=None,
                 payment_channel="OTHER",
@@ -648,24 +702,25 @@ async def import_historical_reconstruction(
                 source_snapshot_ids=list(manifest.input_document_hashes),
                 requires_review=False,
                 date_basis="reconstructed_from_approved_manifest",
-                unit_number=row.unit_number,
+                unit_number=first.unit_number,
                 transaction_origin="reconstructed_historical",
                 reconstruction_batch_id=batch.batch_id,
                 reconstruction_version=manifest.version,
-                assumption_code=row.assumption_code,
-                levy_component=row.levy_component,
+                assumption_code=next(iter(assumption_codes)) if len(assumption_codes) == 1 else "combined_multiple",
+                levy_component=next(iter(levy_components)) if len(levy_components) == 1 else "ordinary",
+                allocations=allocations,
             )
-            touched_account_refs.add(row.account_ref)
+            touched_account_refs.add(first.account_ref)
             if upserted:
                 imported += 1
             else:
                 skipped += 1
         except Exception as exc:
             logger.warning(
-                "Demo Bank reconstruction row error (building=%s batch=%s unit=%s): %s",
-                building_id, batch.batch_id, row.unit_number, exc,
+                "Demo Bank reconstruction group error (building=%s batch=%s unit=%s group=%r): %s",
+                building_id, batch.batch_id, first.unit_number, group_key, exc,
             )
-            errors += 1
+            errors += len(rows)
 
     for account_ref in touched_account_refs:
         await _recompute_balance(db, building_id, account_ref)
@@ -793,6 +848,15 @@ async def _upsert_transaction(
     reconstruction_version: Optional[int] = None,
     assumption_code: Optional[str] = None,
     levy_component: Optional[str] = None,
+    # ── Fund-split allocation lines (additive) ───────────────────────────────
+    # Populated only by import_historical_reconstruction() when a manifest group
+    # combines multiple ReconstructedTransactionRow lines (e.g. admin+sinking)
+    # sharing a payment_group_id into ONE Demo Bank transaction — see
+    # financial-db-issues_plan04.md point 5. Each dict:
+    # {fund_type, amount_cents, amount_ex_gst_cents, gst_cents}. None/empty for
+    # every other call site (single-fund CSV/Strata-Web/manual rows), which
+    # store the whole amount on the top-level amount_cents field as before.
+    allocations: Optional[list[dict]] = None,
 ) -> bool:
     """Upsert one demo_bank_transaction. Returns True if a new document was inserted."""
     ext_id = _external_txn_id(
@@ -850,6 +914,7 @@ async def _upsert_transaction(
         "reconstruction_version": reconstruction_version,
         "assumption_code": assumption_code,
         "levy_component": levy_component,
+        "allocations": allocations or [],
         "created_at": _now(),
     }
 
