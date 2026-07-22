@@ -92,6 +92,17 @@ def _syncable_transaction_filter(since: datetime) -> dict:
     Current Demo Bank rows carry status="posted"/"pending". Some historical
     East Gate staging rows predate that field, so missing status is allowed only
     after the caller has already constrained building_id/account_ref/is_test_data.
+
+    "synthetic_from_budget" rows are excluded unconditionally (East Gate 13195
+    financial-corruption investigation, 2026-07-22): they are fabricated
+    payments computed as unit_uoe x levy_per_uoe_quarterly with a randomized
+    payment date (see historical_levy_reconstruction_service.py in the
+    strata-management repo), not an observed bank movement. Demo Bank's
+    contract is to stage cash movements a real or emulated bank actually
+    reported; a budget-derived assumption is not that, regardless of how
+    confident the reconstruction is. Never widen this back to "$exists: False"
+    catching them by accident — every synthetic_from_budget row is expected to
+    set source_type explicitly.
     """
     return {
         "$and": [
@@ -100,6 +111,7 @@ def _syncable_transaction_filter(since: datetime) -> dict:
                 {"status": {"$in": ["posted", "pending"]}},
                 {"status": {"$exists": False}},
             ]},
+            {"source_type": {"$ne": "synthetic_from_budget"}},
         ]
     }
 
