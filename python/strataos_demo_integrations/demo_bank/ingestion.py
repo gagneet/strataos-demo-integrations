@@ -858,7 +858,32 @@ async def _upsert_transaction(
     # store the whole amount on the top-level amount_cents field as before.
     allocations: Optional[list[dict]] = None,
 ) -> bool:
-    """Upsert one demo_bank_transaction. Returns True if a new document was inserted."""
+    """Upsert one demo_bank_transaction. Returns True if a new document was inserted.
+
+    Rejects any row whose posted_date is after today (real-world UTC date), for
+    every caller/source_type without exception. This function unconditionally
+    writes status="posted" — a transaction that has actually posted/cleared
+    cannot, by definition, be dated in the future, so this is a hard invariant,
+    not a heuristic. Defense-in-depth: this is the single choke point every
+    Demo Bank ingestion path (CSV import, Strata Web inference, manual entry,
+    historical reconstruction) funnels through, so a guard here catches any
+    future generator bug the same way the one this replaces did. Live incident,
+    2026-07-23: east_gate_levy_income_reconstruction.py generated 174
+    transactions dated 2026-09-01/2026-12-01 while running on 2026-07-22/23 —
+    months before either date — because nothing at the ingestion boundary
+    checked posted_date against the real current date. Fixed at the generator
+    level (see strata-management's own as_of_date fix), but that only protects
+    calls THROUGH that one generator; this guard protects every path.
+    """
+    today = datetime.now(timezone.utc).date()
+    if posted_date.date() > today:
+        raise ValueError(
+            f"posted_date {posted_date.date().isoformat()} is after today "
+            f"({today.isoformat()}) — a posted/cleared transaction cannot be "
+            f"dated in the future (source_type={source_type!r}, "
+            f"building_id={building_id!r}, account_ref={account_ref!r})."
+        )
+
     ext_id = _external_txn_id(
         account_ref=account_ref,
         posted_date_iso=posted_date.date().isoformat(),

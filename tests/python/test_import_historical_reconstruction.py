@@ -19,7 +19,7 @@ Coverage targets:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -334,6 +334,70 @@ class TestPaymentGroupCollapsing:
 
 
 # ── 5. Strata Web guard remains untouched ─────────────────────────────────────
+
+class TestFutureDatedTransactionGuard:
+    """Live incident, 2026-07-23: East Gate 13195's levy-income reconstruction
+    generator produced 174 transactions dated months after the date the batch
+    was actually generated on, because nothing at the ingestion boundary
+    checked posted_date against the real current date. _upsert_transaction()
+    is the single choke point every Demo Bank ingestion path funnels through
+    (CSV, Strata Web, manual, historical reconstruction), so the guard lives
+    there — this is the same protection the generator-level as_of_date fix
+    provides, but for every other current and future caller too."""
+
+    @pytest.mark.asyncio
+    async def test_upsert_transaction_rejects_a_future_posted_date(self):
+        from strataos_demo_integrations.demo_bank.ingestion import _upsert_transaction
+
+        db = _make_db()
+        tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+        with pytest.raises(ValueError, match="after today"):
+            await _upsert_transaction(
+                db=db, building_id=_BUILDING_A, account_ref="ADMIN-16244",
+                source_type="manual", source_batch_id=None, is_test_data=True,
+                posted_date=tomorrow, effective_date=tomorrow,
+                amount_cents=11000, direction="credit", description="test",
+                reference=None, payer_name=None, payment_channel="OTHER",
+                running_balance_cents=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_upsert_transaction_accepts_today_and_the_past(self):
+        from strataos_demo_integrations.demo_bank.ingestion import _upsert_transaction
+
+        db = _make_db()
+        for when in (datetime.now(timezone.utc), datetime.now(timezone.utc) - timedelta(days=1)):
+            upserted = await _upsert_transaction(
+                db=db, building_id=_BUILDING_A, account_ref="ADMIN-16244",
+                source_type="manual", source_batch_id=None, is_test_data=True,
+                posted_date=when, effective_date=when,
+                amount_cents=11000, direction="credit", description="test",
+                reference=None, payer_name=None, payment_channel="OTHER",
+                running_balance_cents=None,
+            )
+            assert upserted is True
+
+    @pytest.mark.asyncio
+    async def test_reconstruction_manifest_with_a_future_row_is_reported_as_an_error_not_a_crash(self):
+        """A future-dated row inside an otherwise-valid manifest must not abort
+        the whole materialisation run — it's reported via error_count, matching
+        the existing account_ref-mismatch consistency guard's behaviour, so one
+        bad row in a large batch doesn't block every other correct row."""
+        from strataos_demo_integrations.demo_bank.ingestion import import_historical_reconstruction
+
+        db = _make_db()
+        future_date = date.today() + timedelta(days=30)
+        rows = [
+            _row(unit_number="1", posted_date=date(2024, 3, 15), transaction_sequence=1),
+            _row(unit_number="2", posted_date=future_date, transaction_sequence=2),
+        ]
+        manifest = _manifest(transactions=rows, expected_transaction_count=2)
+        result = await import_historical_reconstruction(db, _BUILDING_A, _batch(), manifest)
+
+        assert result["imported_count"] == 1
+        assert result["error_count"] == 1
+        assert result["import_status"] == "partial"
+
 
 class TestStrataWebGuardUnmodified:
     def test_balance_only_snapshot_still_rejected(self):
