@@ -198,6 +198,41 @@ class FundBalanceReconciliationLine(BaseModel, frozen=True):
     matches_expected_closing: bool
 
 
+class ManifestLevyChargeLine(BaseModel, frozen=True):
+    """One planned per-lot, per-period levy CHARGE (a receivable obligation) — distinct from
+    ReconstructedTransactionRow, which represents Demo Bank receipts/expenses only. Included in
+    the SAME manifest/batch so levy charges and receipts/expenses share one dual-control
+    extract->review->approve workflow, per explicit product decision 2026-07-31 (see
+    docs/finances/reconcilation-2021-2022-finances-plan01.md,
+    docs/finances/reconcilation-2021-2022-finances-plan02.md in the strata-management repo).
+
+    A charge is NEVER materialised via import_historical_reconstruction() / Demo Bank — an
+    approved batch's levy_charge_lines are posted separately (script-only, never HTTP-reachable)
+    via strata-management's FinancialCoreService.create_historical_levy(), which is the ONLY
+    path permitted to post a levy-charge GL journal into a closed accounting period.
+    """
+
+    unit_number: str
+    lot_id: str
+    owner_party_id: str
+    owner_resolution_status: Literal["resolved", "unresolved"] = "resolved"
+    financial_year: str
+    fund_type: Literal["admin", "sinking"]
+    levy_type: Literal["ordinary", "special", "adjustment"] = "ordinary"
+    period: str
+    quarter_no: int
+    issue_date: date
+    due_date: date
+    uoe: float
+    total_uoe: float
+    principal_cents: int
+    gst_cents: int
+    total_cents: int
+    source_annual_control: str
+    derivation_type: str = "document_derived_levy_charge"
+    idempotency_key: str
+
+
 class ReconstructionManifest(BaseModel):
     """The immutable, approved data payload a generate/sync step is allowed to act on.
 
@@ -227,6 +262,10 @@ class ReconstructionManifest(BaseModel):
     year_fund_reconciliation: list[YearFundReconciliationLine] = Field(default_factory=list)
     lot_reconciliation: list[LotReconciliationLine] = Field(default_factory=list)
     fund_balance_reconciliation: list[FundBalanceReconciliationLine] = Field(default_factory=list)
+    # Levy CHARGES (receivable obligations) — see ManifestLevyChargeLine's own docstring for why
+    # these are never part of `transactions`/Demo Bank materialisation despite sharing this
+    # manifest's approval workflow.
+    levy_charge_lines: list[ManifestLevyChargeLine] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     manifest_hash: str  # sha256 over the canonical serialisation of this manifest
 
