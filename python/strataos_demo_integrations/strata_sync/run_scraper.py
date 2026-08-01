@@ -143,6 +143,57 @@ async def _debug_screenshot(page, label: str):
         pass
 
 
+async def click_tab(page, label: str, selectors: list[str], *, timeout: int = 15000) -> None:
+    """Click a committee-report tab, raising instead of silently no-opping.
+
+    The previous per-selector `try/except: continue` loop swallowed every
+    failure to find/click a tab — if neither selector matched
+    `count() > 0 and is_visible()` within one immediate check (no retry), the
+    loop fell through with no exception and no log line, leaving the page on
+    whatever tab was previously active. The caller (extract_owners /
+    extract_financials) would then silently scrape the WRONG tab's table and
+    return zero rows for anything that doesn't match its column shape — a
+    2026-07-31 East Gate sync did exactly this for Owner Positions (0 of 87
+    owner records scraped, job still marked "complete", no error surfaced).
+    wait_for_any_visible already implements a bounded retry loop elsewhere in
+    this file; reusing it here closes the same race for tab navigation.
+    """
+    loc = await wait_for_any_visible(page, selectors, timeout=timeout)
+    await _debug_screenshot(page, f"before_{label}_click")
+    await human_move_and_click(page, loc)
+    await _debug_screenshot(page, f"after_{label}_click")
+
+
+async def click_tab_and_extract(
+        page, label: str, selectors: list[str], extract_fn, *,
+        settle_delay: tuple[float, float] = (2.0, 4.0),
+        retries: int = 3,
+        retry_delay: tuple[float, float] = (3.0, 6.0),
+) -> list:
+    """Click a tab and run its extractor, retrying the click+extract cycle if
+    zero rows come back.
+
+    A strata scheme by definition has both financial line items and owner
+    records — an empty extraction result almost always means the tab click
+    landed on a stale/transitional page state (portal rendering race), not
+    that the underlying data is genuinely empty. Re-clicking the tab and
+    re-extracting is cheap and, per 2026-08-01 East Gate testing, resolves
+    on a second attempt without requiring a full new sync job (fresh login +
+    PIN + report navigation) as the previous zero-rows-completes-silently
+    behaviour did.
+    """
+    for attempt in range(1, retries + 1):
+        await click_tab(page, label, selectors)
+        await asyncio.sleep(random.uniform(*settle_delay))
+        data = await extract_fn(page)
+        if data:
+            return data
+        if attempt < retries:
+            await _debug_screenshot(page, f"{label}_empty_attempt_{attempt}")
+            await asyncio.sleep(random.uniform(*retry_delay))
+    return []
+
+
 async def best_effort_network_idle(page, timeout: int = 6000):
     """Record slow network-idle waits without making portal progress depend on them."""
     try:
@@ -1100,32 +1151,44 @@ async def main(job_id: str, building_id: str):
 
             # ── Scrape financials ──────────────────────────────────────────────
             await update_job(jobs, job_id, status="scraping", message="Extracting budget data...")
-            for selector in ["text=Building Financials", "a:has-text('Building Financials')"]:
-                try:
-                    loc = page.locator(selector).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await human_move_and_click(page, loc)
-                        await asyncio.sleep(random.uniform(2.0, 4.0))
-                        break
-                except Exception:
-                    continue
-            financial_data = await extract_financials(page)
+            financial_data = await click_tab_and_extract(
+                page, "financials_tab",
+                ["text=Building Financials", "a:has-text('Building Financials')"],
+                extract_financials,
+                settle_delay=(2.0, 4.0),
+            )
+            if not financial_data:
+                await _debug_screenshot(page, "financials_extraction_empty")
+                raise RuntimeError(
+                    "Building Financials extraction returned 0 rows after 3 attempts "
+                    "— the tab likely isn't loading/clicking correctly. Check "
+                    "/tmp/strata_scraper_financials_tab_empty_attempt_*.png."
+                )
 
             # ── Scrape bank accounts (same page) ──────────────────────────────
             bank_data = await extract_bank_accounts(page)
 
             # ── Scrape owner positions ─────────────────────────────────────────
             await update_job(jobs, job_id, status="scraping", message="Extracting owner levy positions...")
-            for selector in ["text=Owner Positions", "a:has-text('Owner Positions')"]:
-                try:
-                    loc = page.locator(selector).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await human_move_and_click(page, loc)
-                        await asyncio.sleep(random.uniform(3.0, 6.0))
-                        break
-                except Exception:
-                    continue
-            owner_data = await extract_owners(page)
+            owner_data = await click_tab_and_extract(
+                page, "owner_positions_tab",
+                ["text=Owner Positions", "a:has-text('Owner Positions')"],
+                extract_owners,
+                settle_delay=(3.0, 6.0),
+            )
+            if not owner_data:
+                # A strata scheme by definition has owners — zero rows here (even
+                # after retrying the tab click) means extract_owners scraped the
+                # wrong tab/table, not that the building genuinely has none. Fail
+                # loudly (caught by main()'s outer except, which marks the job
+                # status="error") instead of silently completing with an empty
+                # owners list, as happened 2026-07-31 for East Gate.
+                await _debug_screenshot(page, "owner_extraction_empty")
+                raise RuntimeError(
+                    "Owner Positions extraction returned 0 rows after 3 attempts — "
+                    "the tab likely isn't loading/clicking correctly. Check "
+                    "/tmp/strata_scraper_owner_positions_tab_empty_attempt_*.png."
+                )
 
             await browser.close()
 
