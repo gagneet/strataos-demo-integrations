@@ -857,6 +857,29 @@ async def _sync_scraper_to_levy_collections(mdb, building_id: str, financial_yea
     financial_year: "2025-2026"  →  year = "2026"
     """
     import uuid as _uuid
+
+    # GAP-FIN-035 Item 2 (2026-08-03): router.py's push_data endpoint already checks this same
+    # toggle before calling its own _sync_to_levy_collections, but this function -- the one the
+    # real browser-scraper subprocess actually calls via main() -- had ZERO check, so enabling
+    # the toggle for a building only blocked one of its two write paths.
+    #
+    # This module runs as a standalone subprocess (`python run_scraper.py`, launched via
+    # subprocess.Popen in router.py — see that file's start_scrape_job()), NOT imported as part
+    # of the strataos_demo_integrations package, so it has no parent package context and cannot
+    # use a relative `from .router import ...`. The toggle key is duplicated here as a plain
+    # string constant instead, matching this file's own existing convention of mirroring (not
+    # importing) router.py's logic — see this function's own docstring. Keep this value in sync
+    # with router.py's `_DIRECT_WRITE_TOGGLE` if it ever changes.
+    _DIRECT_WRITE_TOGGLE = "disable_strata_sync_direct_write"
+    from db_postgres.repos import config_repo
+    if await config_repo.resolve_feature_toggle(building_id, _DIRECT_WRITE_TOGGLE, default=False):
+        print(
+            f"[INFO] {_DIRECT_WRITE_TOGGLE} enabled for building {building_id} — "
+            "skipping direct levy-collections write from the scraper subprocess.",
+            flush=True,
+        )
+        return
+
     year = financial_year.split("-")[1] if "-" in financial_year else financial_year
     now = datetime.now(timezone.utc).isoformat()
     _TOTAL_UOE_FALLBACK = 10000
@@ -964,7 +987,20 @@ async def _sync_scraper_to_levy_collections(mdb, building_id: str, financial_yea
         )
         if existing_l:
             upd = {"net_balance": net_bal, "updated_at": now}
-            if existing_l.get("data_source") == "scraper":
+            # GAP-FIN-035 Item 2 (2026-08-03): this previously only recomputed the derived
+            # fields (total_levied/total_paid/admin_*/sinking_*) when the existing doc's own
+            # data_source == "scraper" -- but a doc reconciled through the itemized-backfill
+            # path (east_gate_2021_2025_ledger_sync.py and its 2026 equivalent) never sets
+            # data_source at all; it sets reconciliation_source/reconciliation_note instead.
+            # Net effect: every re-scrape moved net_balance to the newest portal figure while
+            # every OTHER derived field stayed frozen at whatever it was last set to -- a
+            # growing, unexplained gap between "the latest scrape" and what the ledger's own
+            # totals said (the mechanism behind East Gate's live ~$190 discrepancy). Flipped
+            # the polarity: skip recompute only when the doc is explicitly flagged as
+            # reconciled (protect real itemized data from being overwritten by this coarse
+            # scraper-derived estimate); recompute for everything else, including docs that
+            # have never had data_source set at all.
+            if not existing_l.get("reconciliation_note") and not existing_l.get("reconciliation_source"):
                 upd.update({
                     "total_levied": t_levied, "total_paid": t_paid,
                     "admin_levied": round(t_levied * a_ratio, 2),
