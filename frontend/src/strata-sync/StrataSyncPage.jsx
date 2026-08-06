@@ -281,7 +281,7 @@ function fmtMoney(n) {
 
 function PreviewPanel({previewData, onConfirm, onDiscard, loading}) {
     if (!previewData) return null;
-    const {financials = [], owners = [], bank_accounts = [], summary} = previewData;
+    const {financials = [], owners = [], bank_accounts = [], unmatched_invoices = [], summary} = previewData;
     const adminItems = financials.filter(f => f.fund === 'admin');
     const sinkingItems = financials.filter(f => f.fund === 'capital_works');
     const inArrears = owners.filter(o => o.status === 'ARREARS');
@@ -344,11 +344,12 @@ function PreviewPanel({previewData, onConfirm, onDiscard, loading}) {
             </div>
 
             <Tabs defaultValue="admin">
-                <TabsList className="grid w-full grid-cols-4">
+                <TabsList className="grid w-full grid-cols-5">
                     <TabsTrigger value="admin">Admin Fund ({adminItems.length})</TabsTrigger>
                     <TabsTrigger value="sinking">Sinking Fund ({sinkingItems.length})</TabsTrigger>
                     <TabsTrigger value="owners">Owners ({owners.length})</TabsTrigger>
                     <TabsTrigger value="banks">Banks ({bank_accounts.length})</TabsTrigger>
+                    <TabsTrigger value="invoices">Invoices ({unmatched_invoices.length})</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="admin" className="mt-3 max-h-72 overflow-y-auto">
@@ -423,6 +424,46 @@ function PreviewPanel({previewData, onConfirm, onDiscard, loading}) {
                                 </tbody>
                             </table>
                         </div>
+                    )}
+                </TabsContent>
+
+                <TabsContent value="invoices" className="mt-3">
+                    {unmatched_invoices.length === 0 ? (
+                        <p className="text-sm text-gray-400 text-center py-6">
+                            Every current-year invoice reconciled against a Building Financials category — nothing
+                            left over.
+                        </p>
+                    ) : (
+                        <>
+                            <p className="text-xs text-gray-500 mb-2">
+                                Scraped from the Invoices tab but not matched to a Building Financials line item —
+                                review before confirming.
+                            </p>
+                            <div className="rounded-lg border overflow-hidden max-h-72 overflow-y-auto">
+                                <table className="w-full text-xs">
+                                    <thead className="bg-gray-50 sticky top-0">
+                                    <tr>
+                                        <th className="text-left px-3 py-2 font-medium text-gray-600">Date</th>
+                                        <th className="text-left px-3 py-2 font-medium text-gray-600">Invoice Ref</th>
+                                        <th className="text-left px-3 py-2 font-medium text-gray-600">Supplier</th>
+                                        <th className="text-left px-3 py-2 font-medium text-gray-600">Details</th>
+                                        <th className="text-right px-3 py-2 font-medium text-gray-600">Amount</th>
+                                    </tr>
+                                    </thead>
+                                    <tbody className="divide-y">
+                                    {unmatched_invoices.map((inv, i) => (
+                                        <tr key={i} className="hover:bg-gray-50">
+                                            <td className="px-3 py-1.5 font-mono">{inv.date}</td>
+                                            <td className="px-3 py-1.5">{inv.invoice_ref}</td>
+                                            <td className="px-3 py-1.5">{inv.supplier}</td>
+                                            <td className="px-3 py-1.5 truncate max-w-[240px]">{inv.details}</td>
+                                            <td className="px-3 py-1.5 text-right font-mono">${fmtMoney(inv.amount)}</td>
+                                        </tr>
+                                    ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </>
                     )}
                 </TabsContent>
             </Tabs>

@@ -24,7 +24,7 @@ import random
 import re
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import argparse
@@ -641,6 +641,91 @@ async def extract_bank_accounts(page) -> list:
     return records
 
 
+_INVOICE_NEXT_SELECTORS = [
+    "a[rel='next']:visible",
+    "a[aria-label*='next' i]:visible",
+    "input[value*='next' i]:visible",
+    "a:has-text('Next'):visible",
+]
+_NEXT_TEXT_RE = re.compile(r"^(?:next|>|»|›)$", re.I)
+
+
+async def _next_invoice_page_control(page):
+    """Return a visible, enabled pager control on the Invoices tab, or None at the last page."""
+    for selector in _INVOICE_NEXT_SELECTORS:
+        locator = page.locator(selector).first
+        if await locator.count() and await locator.is_enabled():
+            return locator
+
+    # ASP.NET GridView pagers frequently render a bare >, ›, » or an image with
+    # no accessible name — fall back to scanning table links/image-buttons for one.
+    for locator in await page.locator("table a:visible, table input[type='image']:visible").all():
+        text = (await locator.inner_text()).strip()
+        title = ((await locator.get_attribute("title")) or "").strip()
+        alt = ((await locator.get_attribute("alt")) or "").strip()
+        if _NEXT_TEXT_RE.match(text) or "next" in f"{title} {alt}".lower():
+            if await locator.is_enabled():
+                return locator
+    return None
+
+
+async def extract_invoices(page, *, max_pages: int = 500) -> list:
+    """Extract every invoice row across ALL WebForms pagination pages on the Invoices tab.
+
+    Unlike extract_financials() (which reads the Building Financials table as
+    rendered, with category rows expanded in place but no pager), the Invoices
+    tab paginates via an ASP.NET GridView — reading only the current page would
+    silently truncate the result to whatever fits on page 1. This loops the
+    "Next" pager control until it's exhausted or a page repeats the previous
+    page's content (broken/looping pager), instead of hanging or double-counting.
+
+    Assumes the Invoices tab is already open — click_tab_and_extract() clicks
+    it and retries this function on an empty result, so this must not click
+    the tab itself.
+
+    Row shape matches extract_financials()'s inline transaction dicts (same
+    Date | Invoice/Ref | Supplier | Details | Amount column order) so the two
+    can be reconciled directly — see reconcile_transactions_with_invoices().
+    """
+    await page.wait_for_selector("table", timeout=20000)
+    collected: list[dict] = []
+    previous_page_rows: list[dict] | None = None
+
+    for page_number in range(1, max_pages + 1):
+        page_rows: list[dict] = []
+        for table in await page.locator("table").all():
+            raw = await table.inner_text()
+            for cols in extract_table_rows(raw, min_cols=2):
+                first = cols[0].strip()
+                if not first or not _DATE_RE.match(first):
+                    continue  # skip header/section rows — invoice rows start with a date
+                amount_raw = next((c.strip() for c in reversed(cols) if "$" in c.strip()), "0")
+                page_rows.append({
+                    "date": first,
+                    "invoice_ref": cols[1].strip() if len(cols) > 1 else "",
+                    "supplier": cols[2].strip() if len(cols) > 2 else "",
+                    "details": cols[3].strip() if len(cols) > 3 else "",
+                    "amount": parse_money(amount_raw),
+                })
+
+        if page_rows == previous_page_rows:
+            print(f"[WARN] Invoices pagination repeated page {page_number}; stopping.", flush=True)
+            break
+        previous_page_rows = page_rows
+        collected.extend(page_rows)
+
+        next_control = await _next_invoice_page_control(page)
+        if next_control is None:
+            break
+        await next_control.click()
+        await page.wait_for_load_state("domcontentloaded")
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+    else:
+        print(f"[WARN] Invoices tab exceeded the {max_pages}-page safety limit — stopping.", flush=True)
+
+    return collected
+
+
 # ─── Data enrichment ──────────────────────────────────────────────────────────
 
 def _classify_fund(category: str) -> str:
@@ -675,6 +760,99 @@ def enrich_financials(records: list) -> list:
         }
         for r in records
     ]
+
+
+def _current_financial_year(now: datetime | None = None) -> str:
+    """Australian financial year (July-June), e.g. '2025-2026'.
+
+    Accepts an explicit `now` for testability; defaults to the real clock.
+    Callers that need the FY for both reconciliation and persistence within a
+    single job run must compute it once and pass it through, rather than each
+    calling this again — otherwise a sync that straddles the July 1 rollover
+    could reconcile against one FY window and persist under another.
+    """
+    now = now or datetime.now(timezone.utc)
+    fy_start = now.year - 1 if now.month < 7 else now.year
+    return f"{fy_start}-{fy_start + 1}"
+
+
+def _financial_year_window(financial_year: str) -> tuple[date, date]:
+    """'2025-2026' -> (2025-07-01, 2026-06-30), Australian FY (July-June)."""
+    fy_start = int(financial_year.split("-")[0])
+    return date(fy_start, 7, 1), date(fy_start + 1, 6, 30)
+
+
+def _parse_portal_date(value: str) -> date | None:
+    """Parse the portal's DD/MM/YYYY (or D/M/YYYY) date text; None if unparseable."""
+    try:
+        return datetime.strptime(value.strip(), "%d/%m/%Y").date()
+    except (ValueError, AttributeError):
+        return None
+
+
+def reconcile_transactions_with_invoices(financials: list, invoices: list, financial_year: str) -> tuple[list, list]:
+    """Merge each category's inline expense detail (Building Financials row
+    expansion) with the Invoices tab's paginated rows, so the same invoice is
+    never counted twice between the two views.
+
+    Only transactions dated inside `financial_year`'s July-June window are
+    reconciled — prior-year detail rows shown inline for reference are left
+    untouched, since the Invoices tab only paginates the current year.
+
+    A transaction and an invoice are treated as the same underlying record
+    when they share date + amount + invoice_ref. When several invoices share
+    just date + amount (no invoice_ref match), the link is ambiguous, so the
+    inline transaction is left as-is rather than risking a wrong merge that
+    would silently drop or double a real invoice.
+
+    On a match, the Invoices-tab row replaces the inline one (it's the
+    authoritative, fully-paginated source, tagged with the category it
+    belongs to). Unmatched inline transactions are kept unchanged. Invoices
+    with no matching category are returned separately as `unmatched_invoices`
+    rather than discarded, so nothing scraped is silently lost.
+
+    Returns (reconciled_financials, unmatched_invoices).
+    """
+    fy_start, fy_end = _financial_year_window(financial_year)
+
+    def exact_key(row: dict) -> tuple:
+        return (row.get("date"), round(row.get("amount") or 0.0, 2), row.get("invoice_ref") or "")
+
+    def loose_key(row: dict) -> tuple:
+        return (row.get("date"), round(row.get("amount") or 0.0, 2))
+
+    by_exact_key: dict[tuple, dict] = {}
+    by_loose_key: dict[tuple, list] = {}
+    for inv in invoices:
+        by_exact_key.setdefault(exact_key(inv), inv)
+        by_loose_key.setdefault(loose_key(inv), []).append(inv)
+
+    def find_match(txn: dict):
+        exact = by_exact_key.get(exact_key(txn))
+        if exact is not None:
+            return exact
+        candidates = by_loose_key.get(loose_key(txn), [])
+        return candidates[0] if len(candidates) == 1 else None
+
+    matched_invoice_ids = set()
+    reconciled = []
+    for fin in financials:
+        merged = []
+        for txn in fin.get("transactions") or []:
+            parsed_date = _parse_portal_date(txn.get("date", ""))
+            if parsed_date is None or not (fy_start <= parsed_date <= fy_end):
+                merged.append(txn)  # outside the current FY window — leave as-is
+                continue
+            match = find_match(txn)
+            if match is None:
+                merged.append(txn)  # no Invoices-tab counterpart — keep the inline copy
+                continue
+            merged.append({**match, "category": fin["category"]})
+            matched_invoice_ids.add(id(match))
+        reconciled.append({**fin, "transactions": merged})
+
+    unmatched_invoices = [inv for inv in invoices if id(inv) not in matched_invoice_ids]
+    return reconciled, unmatched_invoices
 
 
 def split_owner_name(combined: str) -> tuple:
@@ -768,13 +946,9 @@ def build_summary(building_id: str, owners: list, financials: list) -> dict:
 
 # ─── MongoDB upsert ───────────────────────────────────────────────────────────
 
-async def upsert_to_mongo(mdb, building_id: str, financials: list, owners: list, summary: dict, bank_accounts: list):
+async def upsert_to_mongo(mdb, building_id: str, financials: list, owners: list, summary: dict, bank_accounts: list,
+                           financial_year: str):
     now = datetime.now(timezone.utc).isoformat()
-
-    # Australian financial year: July–June
-    yr, mo = int(now[:4]), int(now[5:7])
-    fy_start = yr - 1 if mo < 7 else yr
-    financial_year = f"{fy_start}-{fy_start + 1}"
 
     for fin in financials:
         await mdb["strata_financials"].update_one(
@@ -1226,6 +1400,22 @@ async def main(job_id: str, building_id: str):
                     "/tmp/strata_scraper_owner_positions_tab_empty_attempt_*.png."
                 )
 
+            # ── Scrape the Invoices tab (paginated) ────────────────────────────
+            # Best-effort: unlike Building Financials / Owner Positions, an
+            # Invoices tab isn't guaranteed on every portal/building, so a
+            # missing tab is logged and skipped rather than failing the sync.
+            await update_job(jobs, job_id, status="scraping", message="Extracting invoice detail...")
+            try:
+                invoice_data = await click_tab_and_extract(
+                    page, "invoices_tab",
+                    ["text=Invoices", "a:has-text('Invoices')"],
+                    extract_invoices,
+                    settle_delay=(2.0, 4.0),
+                )
+            except TimeoutError as exc:
+                print(f"[WARN] Invoices tab not found — skipping reconciliation: {exc}", flush=True)
+                invoice_data = []
+
             await browser.close()
 
         # ── Enrich & build preview ─────────────────────────────────────────────
@@ -1233,6 +1423,10 @@ async def main(job_id: str, building_id: str):
             jobs, job_id,
             status="cleaning",
             message=f"Cleaning {len(financial_data)} budget items and {len(owner_data)} owner records...",
+        )
+        financial_year = _current_financial_year()
+        financial_data, unmatched_invoices = reconcile_transactions_with_invoices(
+            financial_data, invoice_data, financial_year,
         )
         financials_clean = enrich_financials(financial_data)
         owners_clean = enrich_owners(owner_data)
@@ -1249,12 +1443,14 @@ async def main(job_id: str, building_id: str):
                     f"Review {len(admin_fin)} admin + {len(cw_fin)} sinking fund items, "
                     f"{len(owners_clean)} owner positions"
                     + (f", {len(bank_accounts_clean)} bank account(s)" if bank_accounts_clean else "")
+                    + (f", {len(unmatched_invoices)} unmatched invoice(s)" if unmatched_invoices else "")
                     + " — confirm to save or discard to cancel."
             ),
             preview_data={
                 "financials": financials_clean,
                 "owners": owners_clean,
                 "bank_accounts": bank_accounts_clean,
+                "unmatched_invoices": unmatched_invoices,
                 "summary": summary,
             },
         )
@@ -1279,7 +1475,8 @@ async def main(job_id: str, building_id: str):
 
         # ── Confirmed: write to DB ─────────────────────────────────────────────
         await update_job(jobs, job_id, status="syncing", message="Saving data to the system...")
-        await upsert_to_mongo(mdb, building_id, financials_clean, owners_clean, summary, bank_accounts_clean)
+        await upsert_to_mongo(mdb, building_id, financials_clean, owners_clean, summary, bank_accounts_clean,
+                               financial_year)
 
         await update_job(
             jobs, job_id,
