@@ -17,7 +17,16 @@ Coverage:
    risking a wrong merge.
 4. Invoices with no matching inline transaction are returned as unmatched_invoices,
    never silently dropped.
-5. _parse_portal_date / _financial_year_window / _current_financial_year edge cases.
+5. Matching is done on the *parsed* date, not the raw portal string — "5/8/2025" and
+   "05/08/2025" must match, since the two GridViews are not guaranteed to format the
+   same date identically (2026-08-06 audit finding: the original implementation keyed
+   on the raw string and silently failed to match any such pair).
+6. Duplicate invoices sharing the same (date, amount, invoice_ref) pair off with
+   duplicate inline transactions one-to-one, in encounter order, instead of every
+   duplicate transaction collapsing onto a single retained invoice (2026-08-06 audit
+   finding: the original implementation used dict.setdefault(), which silently
+   discarded every invoice past the first for a given exact key).
+7. _parse_portal_date / _financial_year_window / _current_financial_year edge cases.
 """
 from __future__ import annotations
 
@@ -95,6 +104,38 @@ def test_unmatched_invoices_never_silently_dropped():
 
     assert len(reconciled[0]["transactions"]) == 1
     assert unmatched == [invoices[1]]
+
+
+def test_matches_across_differently_padded_date_strings():
+    """The two GridViews are not guaranteed to render the same date identically."""
+    inline = [{"date": "5/8/2025", "invoice_ref": "INV-1", "supplier": "ACME",
+               "details": "old details", "amount": 250.0}]
+    invoice = {"date": "05/08/2025", "invoice_ref": "INV-1", "supplier": "ACME Pty Ltd",
+               "details": "August cleaning", "amount": 250.0}
+
+    reconciled, unmatched = reconcile_transactions_with_invoices(_financials(inline), [invoice], FY)
+
+    [txn] = reconciled[0]["transactions"]
+    assert txn["supplier"] == "ACME Pty Ltd"
+    assert unmatched == []
+
+
+def test_duplicate_invoices_pair_off_one_to_one_with_duplicate_transactions():
+    """Two identical (date, amount, invoice_ref) invoices must not collapse onto one match."""
+    inline = [
+        {"date": "15/08/2025", "invoice_ref": "INV-1", "supplier": "ACME", "details": "old-a", "amount": 250.0},
+        {"date": "15/08/2025", "invoice_ref": "INV-1", "supplier": "ACME", "details": "old-b", "amount": 250.0},
+    ]
+    invoices = [
+        {"date": "15/08/2025", "invoice_ref": "INV-1", "supplier": "ACME", "details": "tab-1", "amount": 250.0},
+        {"date": "15/08/2025", "invoice_ref": "INV-1", "supplier": "ACME", "details": "tab-2", "amount": 250.0},
+    ]
+
+    reconciled, unmatched = reconcile_transactions_with_invoices(_financials(inline), invoices, FY)
+
+    matched_details = sorted(txn["details"] for txn in reconciled[0]["transactions"])
+    assert matched_details == ["tab-1", "tab-2"]  # both duplicate txns matched, not both onto the same invoice
+    assert unmatched == []  # both duplicate invoices consumed, none left over
 
 
 def test_financial_year_window_is_july_to_june():

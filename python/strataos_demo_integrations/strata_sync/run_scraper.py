@@ -686,13 +686,16 @@ async def extract_invoices(page, *, max_pages: int = 500) -> list:
     Row shape matches extract_financials()'s inline transaction dicts (same
     Date | Invoice/Ref | Supplier | Details | Amount column order) so the two
     can be reconciled directly — see reconcile_transactions_with_invoices().
+    ASSUMPTION, unverified against the live portal: the Invoices tab renders
+    that same column order. If it doesn't, this silently misparses every
+    field — check headed against a real sync before trusting this in
+    production (see this file's other tab-scraping functions for the same
+    caveat pattern).
     """
     await page.wait_for_selector("table", timeout=20000)
-    collected: list[dict] = []
-    previous_page_rows: list[dict] | None = None
 
-    for page_number in range(1, max_pages + 1):
-        page_rows: list[dict] = []
+    async def _read_current_page() -> list[dict]:
+        rows: list[dict] = []
         for table in await page.locator("table").all():
             raw = await table.inner_text()
             for cols in extract_table_rows(raw, min_cols=2):
@@ -700,17 +703,24 @@ async def extract_invoices(page, *, max_pages: int = 500) -> list:
                 if not first or not _DATE_RE.match(first):
                     continue  # skip header/section rows — invoice rows start with a date
                 amount_raw = next((c.strip() for c in reversed(cols) if "$" in c.strip()), "0")
-                page_rows.append({
+                rows.append({
                     "date": first,
                     "invoice_ref": cols[1].strip() if len(cols) > 1 else "",
                     "supplier": cols[2].strip() if len(cols) > 2 else "",
                     "details": cols[3].strip() if len(cols) > 3 else "",
                     "amount": parse_money(amount_raw),
                 })
+        return rows
 
+    collected: list[dict] = []
+    previous_page_rows: list[dict] | None = None
+
+    for page_number in range(1, max_pages + 1):
+        page_rows = await _read_current_page()
         if page_rows == previous_page_rows:
-            print(f"[WARN] Invoices pagination repeated page {page_number}; stopping.", flush=True)
-            break
+            if page_rows:
+                print(f"[WARN] Invoices pagination repeated page {page_number}; stopping.", flush=True)
+            break  # also covers a genuinely-empty tab: page_rows == previous_page_rows == []
         previous_page_rows = page_rows
         collected.extend(page_rows)
 
@@ -719,7 +729,21 @@ async def extract_invoices(page, *, max_pages: int = 500) -> list:
             break
         await next_control.click()
         await page.wait_for_load_state("domcontentloaded")
-        await asyncio.sleep(random.uniform(0.5, 1.0))
+
+        # ASP.NET UpdatePanel postbacks routinely outlast domcontentloaded — a
+        # flat sleep here previously risked re-reading the page just collected
+        # on the next loop iteration, which the repeated-page check above would
+        # then mistake for "reached the last page", silently truncating results
+        # before the real end. Poll (bounded ~10s) until the visible content
+        # actually changes instead.
+        for _ in range(40):
+            await asyncio.sleep(0.25)
+            if await _read_current_page() != page_rows:
+                break
+        else:
+            print(f"[WARN] Invoices Next control did not advance from page {page_number} "
+                  f"within 10s; stopping with partial results.", flush=True)
+            break
     else:
         print(f"[WARN] Invoices tab exceeded the {max_pages}-page safety limit — stopping.", flush=True)
 
@@ -805,6 +829,19 @@ def reconcile_transactions_with_invoices(financials: list, invoices: list, finan
     inline transaction is left as-is rather than risking a wrong merge that
     would silently drop or double a real invoice.
 
+    Keys are built from the *parsed* date, not the raw portal string — the
+    inline (Building Financials row-expansion) and Invoices-tab views are two
+    separately-rendered ASP.NET GridViews and are not guaranteed to format the
+    same date identically (e.g. "5/8/2025" vs "05/08/2025"); matching on the
+    raw string would silently fail every such pair even though both sides
+    parse to the same calendar date.
+
+    Genuine duplicates (two invoices sharing the same date+amount+invoice_ref,
+    e.g. two separate same-day payments of an identical amount) are paired
+    off with duplicate inline transactions one-to-one, in encounter order,
+    instead of every duplicate transaction collapsing onto a single retained
+    invoice — each invoice can be consumed as a match at most once.
+
     On a match, the Invoices-tab row replaces the inline one (it's the
     authoritative, fully-paginated source, tagged with the category it
     belongs to). Unmatched inline transactions are kept unchanged. Invoices
@@ -816,25 +853,31 @@ def reconcile_transactions_with_invoices(financials: list, invoices: list, finan
     fy_start, fy_end = _financial_year_window(financial_year)
 
     def exact_key(row: dict) -> tuple:
-        return (row.get("date"), round(row.get("amount") or 0.0, 2), row.get("invoice_ref") or "")
+        return (_parse_portal_date(row.get("date", "")), round(row.get("amount") or 0.0, 2),
+                row.get("invoice_ref") or "")
 
     def loose_key(row: dict) -> tuple:
-        return (row.get("date"), round(row.get("amount") or 0.0, 2))
+        return (_parse_portal_date(row.get("date", "")), round(row.get("amount") or 0.0, 2))
 
-    by_exact_key: dict[tuple, dict] = {}
+    by_exact_key: dict[tuple, list] = {}
     by_loose_key: dict[tuple, list] = {}
     for inv in invoices:
-        by_exact_key.setdefault(exact_key(inv), inv)
+        by_exact_key.setdefault(exact_key(inv), []).append(inv)
         by_loose_key.setdefault(loose_key(inv), []).append(inv)
 
-    def find_match(txn: dict):
-        exact = by_exact_key.get(exact_key(txn))
-        if exact is not None:
-            return exact
-        candidates = by_loose_key.get(loose_key(txn), [])
-        return candidates[0] if len(candidates) == 1 else None
+    matched_invoice_ids: set[int] = set()
 
-    matched_invoice_ids = set()
+    def find_match(txn: dict):
+        # Filtering by matched_invoice_ids on every lookup (rather than mutating
+        # the maps) keeps a single source of truth for "already consumed" and
+        # lets a loose-key ambiguity resolve itself once other candidates are
+        # claimed elsewhere, without a second bookkeeping pass.
+        exact_candidates = [inv for inv in by_exact_key.get(exact_key(txn), []) if id(inv) not in matched_invoice_ids]
+        if exact_candidates:
+            return exact_candidates[0]
+        loose_candidates = [inv for inv in by_loose_key.get(loose_key(txn), []) if id(inv) not in matched_invoice_ids]
+        return loose_candidates[0] if len(loose_candidates) == 1 else None
+
     reconciled = []
     for fin in financials:
         merged = []
